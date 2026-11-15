@@ -1,51 +1,130 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import app
 
 
-def test_finance_and_tasks_work_with_sqlite(tmp_path, monkeypatch):
-    test_db = tmp_path / "obra_manager_test.db"
-    monkeypatch.setattr(app, "DB_PATH", test_db)
+class FakeSupabaseResult:
+    def __init__(self, data):
+        self.data = data
 
-    app.init_db()
 
-    app.add_financial_entry(
-        tipo="Receita",
-        descricao="Pagamento inicial",
-        categoria="Adiantamento",
-        valor=1500.00,
-        data="2026-11-01",
-        observacoes="Recebido",
+class FakeSupabaseQuery:
+    def __init__(self, client, table):
+        self.client = client
+        self.table_name = table
+        self.action = "select"
+        self.payload = None
+        self.filters = []
+        self.ordering = []
+        self.limit_value = None
+
+    def select(self, *_args, **_kwargs):
+        if self.action == "select":
+            self.action = "select"
+        return self
+
+    def insert(self, payload):
+        self.action = "insert"
+        self.payload = payload
+        return self
+
+    def update(self, payload):
+        self.action = "update"
+        self.payload = payload
+        return self
+
+    def delete(self):
+        self.action = "delete"
+        return self
+
+    def eq(self, column, value):
+        self.filters.append((column, value))
+        return self
+
+    def order(self, column, desc=False):
+        self.ordering.append((column, desc))
+        return self
+
+    def limit(self, value):
+        self.limit_value = value
+        return self
+
+    def execute(self):
+        rows = self.client.tables.setdefault(self.table_name, [])
+        if self.action == "insert":
+            inserted = dict(self.payload)
+            inserted["id"] = self.client.next_id
+            self.client.next_id += 1
+            rows.append(inserted)
+            return FakeSupabaseResult([inserted])
+
+        matches = [
+            row for row in rows
+            if all(row.get(column) == value for column, value in self.filters)
+        ]
+        if self.action == "update":
+            for row in matches:
+                row.update(self.payload)
+            return FakeSupabaseResult(matches)
+        if self.action == "delete":
+            self.client.tables[self.table_name] = [row for row in rows if row not in matches]
+            return FakeSupabaseResult(matches)
+
+        for column, descending in reversed(self.ordering):
+            matches.sort(key=lambda row: row.get(column) or "", reverse=descending)
+        if self.limit_value is not None:
+            matches = matches[:self.limit_value]
+        return FakeSupabaseResult(matches)
+
+
+class FakeSupabaseClient:
+    def __init__(self):
+        self.tables = {"obras": [], "movimentos_financeiros": [], "tarefas": []}
+        self.next_id = 1
+        self.queried_tables = []
+
+    def table(self, table_name):
+        self.queried_tables.append(table_name)
+        return FakeSupabaseQuery(self, table_name)
+
+
+def test_finance_and_tasks_are_saved_to_supabase_for_active_work(monkeypatch):
+    client = FakeSupabaseClient()
+    monkeypatch.setattr(app, "get_data_client", lambda: client)
+    monkeypatch.setattr(app.st, "session_state", {"active_work_id": None})
+
+    work_id = app.create_or_update_work(
+        nome="Obra segura",
+        cliente="Cliente",
+        local="Lisboa",
+        gestor="João",
+        data_inicio="2026-11-01",
+        data_fim="2026-12-01",
+        valor_obra=12000,
+        tipo_iva="Com IVA",
+        iva=23,
+        status="Em execução",
     )
-    app.add_financial_entry(
-        tipo="Despesa",
-        descricao="Compra de materiais",
-        categoria="Materiais",
-        valor=500.00,
-        data="2026-11-02",
-        observacoes="Cimento",
+    app.add_financial_entry("Receita", "Adiantamento", "Pagamentos", 1500, "2026-11-02")
+    app.add_financial_entry("Despesa", "Cimento", "Materiais", 500, "2026-11-03")
+    task_id = app.add_task(
+        "Preparar fundação", "Escavação e nivelamento", "João", "Alta",
+        "2026-11-05", "2026-11-08",
     )
 
     summary = app.get_financial_summary()
-    assert summary["receitas"] == 1500.0
-    assert summary["despesas"] == 500.0
-    assert summary["saldo"] == 1000.0
-
-    task_id = app.add_task(
-        titulo="Preparar fundação",
-        descricao="Executar escavação e nivelamento",
-        responsavel="João",
-        prioridade="Alta",
-        data_inicio="2026-11-05",
-        data_fim="2026-11-08",
-        status="Pendente",
-    )
-
     tasks = app.get_tasks()
-    assert task_id > 0
-    assert len(tasks) == 1
+    assert work_id == 1
+    assert summary == {"receitas": 1500.0, "despesas": 500.0, "saldo": 1000.0, "registos": 2}
+    assert task_id == 4
     assert tasks[0]["titulo"] == "Preparar fundação"
-    assert tasks[0]["status"] == "Pendente"
+    assert all(row["obra_id"] == work_id for row in client.tables["movimentos_financeiros"])
+    assert client.tables["tarefas"][0]["obra_id"] == work_id
+    assert "obras" in client.queried_tables
+    assert "movimentos_financeiros" in client.queried_tables
+    assert "tarefas" in client.queried_tables
 
 
 def test_translation_keys_cover_required_languages():
@@ -194,60 +273,35 @@ def test_reads_domain_password_credential(monkeypatch):
     assert app.read_windows_credential() == "credential-key"
 
 
-def test_supabase_connection_uses_key_without_exposing_it(monkeypatch):
-    request = {}
-
-    class SuccessfulResponse:
-        is_success = True
-        status_code = 200
-
-    def fake_get(url, params, headers, timeout):
-        request.update(url=url, params=params, headers=headers, timeout=timeout)
-        return SuccessfulResponse()
-
-    monkeypatch.setattr(
-        app,
-        "get_supabase_config",
-        lambda: ("https://example.supabase.co", "credential-key"),
-    )
-    monkeypatch.setattr(app.httpx, "get", fake_get)
-
+def test_supabase_connection_uses_authenticated_data_client(monkeypatch):
+    client = FakeSupabaseClient()
+    monkeypatch.setattr(app, "get_data_client", lambda: client)
     connected, message = app.test_supabase_connection()
 
     assert connected is True
-    assert "credential-key" not in message
-    assert request["url"] == "https://example.supabase.co/rest/v1/obras"
-    assert request["params"] == {"select": "id", "limit": 1}
-    assert request["headers"] == {"apikey": "credential-key"}
+    assert "autenticada" in message
+    assert client.queried_tables == ["obras"]
 
 
-def test_missing_supabase_table_still_confirms_project_access(monkeypatch):
-    class MissingTableResponse:
-        is_success = False
-        status_code = 404
-
+def test_supabase_connection_fails_closed_when_authenticated_query_fails(monkeypatch):
+    class BrokenClient:
         @staticmethod
-        def json():
-            return {"code": "PGRST205"}
+        def table(_table_name):
+            raise RuntimeError("permission denied")
 
-    monkeypatch.setattr(
-        app,
-        "get_supabase_config",
-        lambda: ("https://example.supabase.co", "credential-key"),
-    )
-    monkeypatch.setattr(app.httpx, "get", lambda *_args, **_kwargs: MissingTableResponse())
+    monkeypatch.setattr(app, "get_data_client", lambda: BrokenClient())
 
     connected, message = app.test_supabase_connection()
 
-    assert connected is True
-    assert "public.obras" in message
+    assert connected is False
+    assert "políticas RLS" in message
 
 
-def test_multi_work_crud_and_active_selection(tmp_path, monkeypatch):
-    test_db = tmp_path / "obra_manager_test.db"
-    monkeypatch.setattr(app, "DB_PATH", test_db)
-
-    app.init_db()
+def test_multi_work_crud_and_active_selection_uses_supabase(monkeypatch):
+    client = FakeSupabaseClient()
+    session_state = {"active_work_id": None}
+    monkeypatch.setattr(app, "get_data_client", lambda: client)
+    monkeypatch.setattr(app.st, "session_state", session_state)
 
     work_id_a = app.create_or_update_work(
         nome="Obra A",
@@ -284,8 +338,28 @@ def test_multi_work_crud_and_active_selection(tmp_path, monkeypatch):
     works = app.list_works()
     assert len(works) == 2
     assert {item["nome"] for item in works} == {"Obra A", "Obra B"}
+    assert session_state["active_work_id"] == work_id_b
 
     app.delete_work(work_id_a)
     works_after = app.list_works()
     assert len(works_after) == 1
     assert works_after[0]["nome"] == "Obra B"
+    assert "configuracao_obra" not in client.tables
+
+
+def test_app_has_no_local_sqlite_storage():
+    assert not hasattr(app, "DB_PATH")
+    assert not hasattr(app, "get_connection")
+    assert not hasattr(app, "init_db")
+
+
+def test_database_migrations_do_not_grant_anonymous_data_access():
+    migration_dir = Path(__file__).resolve().parents[1] / "supabase" / "migrations"
+    initial_schema = (migration_dir / "20261111_initial_schema.sql").read_text(encoding="utf-8").lower()
+    hardening = (migration_dir / "20261115_secure_authenticated_access.sql").read_text(encoding="utf-8").lower()
+    usernames = (migration_dir / "20261112_usernames.sql").read_text(encoding="utf-8").lower()
+
+    assert "to anon" not in initial_schema
+    assert "from public, anon" in hardening
+    assert "from public, anon, authenticated" in usernames
+    assert "grant select on table public.user_profiles to authenticated" not in usernames

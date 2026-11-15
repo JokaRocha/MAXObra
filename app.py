@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,7 +10,6 @@ from login_page import render_login_page
 
 load_dotenv()
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "obra_manager.db"
 LOGO_PATH = Path(__file__).resolve().parent / "img" / "logo_maxobra.png"
 LANGUAGES = ["pt", "es", "en", "de", "fr"]
 SUPABASE_CREDENTIAL_TARGET = "MAXObra-Supabase"
@@ -329,33 +327,11 @@ def render_page_heading(title: str) -> None:
 
 
 def test_supabase_connection() -> tuple[bool, str]:
-    url, key = get_supabase_config()
-    if not url:
-        return False, "Configure SUPABASE_URL no ambiente do Windows ou no ficheiro .env."
-    if not key:
-        return False, "SUPABASE_KEY está vazia ou não foi encontrada no Gestor de Credenciais do Windows."
-
     try:
-        response = httpx.get(
-            f"{url.rstrip('/')}/rest/v1/obras",
-            params={"select": "id", "limit": 1},
-            headers={"apikey": key},
-            timeout=10,
-        )
-    except httpx.RequestError:
-        return False, "Não foi possível contactar o Supabase. Verifique a ligação à Internet e o URL."
-
-    if response.is_success:
-        return True, "Ligação ao Supabase estabelecida."
-    if response.status_code == 404:
-        try:
-            if response.json().get("code") == "PGRST205":
-                return True, "Chave aceite; ligação ativa. A tabela public.obras ainda não existe no Supabase."
-        except ValueError:
-            pass
-    if response.status_code in (401, 403):
-        return False, "O Supabase rejeitou a chave ou negou acesso à tabela public.obras."
-    return False, f"O Supabase respondeu com HTTP {response.status_code}."
+        get_data_client().table("obras").select("id").limit(1).execute()
+        return True, "Ligação autenticada ao Supabase estabelecida; as políticas RLS estão ativas para esta sessão."
+    except Exception:
+        return False, "Não foi possível consultar obras com esta sessão. Confirme schema, sessão e políticas RLS no Supabase."
 LANGUAGE_LABELS = {
     "pt": "PT",
     "es": "ES",
@@ -458,82 +434,11 @@ def format_language_option(lang: str) -> str:
     return LANGUAGE_LABELS.get(lang, lang.upper())
 
 
-def get_connection() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db() -> None:
-    with get_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS obras (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT,
-                cliente TEXT,
-                local TEXT,
-                gestor TEXT,
-                data_inicio TEXT,
-                data_fim TEXT,
-                valor_obra REAL DEFAULT 0,
-                tipo_iva TEXT DEFAULT 'Sem IVA',
-                iva REAL DEFAULT 0,
-                status TEXT DEFAULT 'Planeamento'
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS configuracao_obra (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                obra_ativa_id INTEGER DEFAULT 1
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS movimentos_financeiros (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tipo TEXT,
-                descricao TEXT,
-                categoria TEXT,
-                valor REAL DEFAULT 0,
-                data TEXT,
-                observacoes TEXT
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tarefas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                titulo TEXT,
-                descricao TEXT,
-                responsavel TEXT,
-                prioridade TEXT,
-                data_inicio TEXT,
-                data_fim TEXT,
-                status TEXT DEFAULT 'Pendente'
-            )
-            """
-        )
-
-        columns = conn.execute("PRAGMA table_info(configuracao_obra)").fetchall()
-        existing = {column[1] for column in columns}
-        if "obra_ativa_id" not in existing:
-            conn.execute("ALTER TABLE configuracao_obra ADD COLUMN obra_ativa_id INTEGER DEFAULT 1")
-
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO configuracao_obra (id, obra_ativa_id)
-            VALUES (1, NULL)
-            """
-        )
+def get_data_client():
+    client = get_supabase_auth_client()
+    if client is None:
+        raise RuntimeError("A sessão Supabase não está disponível.")
+    return client
 
 
 def create_or_update_work(
@@ -549,94 +454,70 @@ def create_or_update_work(
     status: str,
     work_id: int | None = None,
 ) -> int:
-    with get_connection() as conn:
-        if work_id is not None:
-            conn.execute(
-                """
-                UPDATE obras SET
-                    nome = ?, cliente = ?, local = ?, gestor = ?,
-                    data_inicio = ?, data_fim = ?, valor_obra = ?,
-                    tipo_iva = ?, iva = ?, status = ?
-                WHERE id = ?
-                """,
-                (
-                    nome,
-                    cliente,
-                    local,
-                    gestor,
-                    data_inicio,
-                    data_fim,
-                    float(valor_obra),
-                    tipo_iva,
-                    float(iva),
-                    status,
-                    work_id,
-                ),
-            )
-            active_id = work_id
-        else:
-            cursor = conn.execute(
-                """
-                INSERT INTO obras (nome, cliente, local, gestor, data_inicio, data_fim, valor_obra, tipo_iva, iva, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    nome,
-                    cliente,
-                    local,
-                    gestor,
-                    data_inicio,
-                    data_fim,
-                    float(valor_obra),
-                    tipo_iva,
-                    float(iva),
-                    status,
-                ),
-            )
-            active_id = int(cursor.lastrowid)
+    client = get_data_client()
+    payload = {
+        "nome": nome,
+        "cliente": cliente,
+        "local": local,
+        "gestor": gestor,
+        "data_inicio": data_inicio or None,
+        "data_fim": data_fim or None,
+        "valor_obra": float(valor_obra),
+        "tipo_iva": tipo_iva,
+        "iva": float(iva),
+        "status": status,
+    }
+    if work_id is not None:
+        rows = client.table("obras").update(payload).eq("id", work_id).select("id").execute().data or []
+        if not rows:
+            raise PermissionError("A obra não existe ou a sessão não tem permissão para a alterar.")
+        active_id = int(work_id)
+    else:
+        rows = client.table("obras").insert(payload).execute().data or []
+        if not rows:
+            raise RuntimeError("O Supabase não confirmou a criação da obra.")
+        active_id = int(rows[0]["id"])
 
-        conn.execute("UPDATE configuracao_obra SET obra_ativa_id = ? WHERE id = 1", (active_id,))
-        return active_id
+    st.session_state["active_work_id"] = active_id
+    return active_id
 
 
 def list_works() -> list[dict]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, nome, cliente, local, gestor, data_inicio, data_fim, valor_obra, tipo_iva, iva, status
-            FROM obras
-            ORDER BY id ASC
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
+    result = get_data_client().table("obras").select(
+        "id,nome,cliente,local,gestor,data_inicio,data_fim,valor_obra,tipo_iva,iva,status"
+    ).order("id").execute()
+    return result.data or []
 
 
 def set_active_work(work_id: int) -> None:
-    with get_connection() as conn:
-        conn.execute("UPDATE configuracao_obra SET obra_ativa_id = ? WHERE id = 1", (work_id,))
+    if not any(int(work["id"]) == int(work_id) for work in list_works()):
+        raise ValueError("A obra selecionada não está disponível nesta conta.")
+    st.session_state["active_work_id"] = int(work_id)
 
 
 def get_active_work() -> dict | None:
-    with get_connection() as conn:
-        work_id = conn.execute("SELECT obra_ativa_id FROM configuracao_obra WHERE id = 1").fetchone()
-        if work_id is None:
-            return None
-        active_id = work_id[0]
-        row = conn.execute("SELECT * FROM obras WHERE id = ?", (active_id,)).fetchone()
-    return dict(row) if row else None
+    works = list_works()
+    if not works:
+        st.session_state.pop("active_work_id", None)
+        return None
+
+    active_id = st.session_state.get("active_work_id")
+    active_work = next((work for work in works if int(work["id"]) == active_id), None)
+    if active_work is None:
+        active_work = works[0]
+        st.session_state["active_work_id"] = int(active_work["id"])
+    return active_work
 
 
 def delete_work(work_id: int) -> None:
-    with get_connection() as conn:
-        conn.execute("DELETE FROM obras WHERE id = ?", (work_id,))
-        remaining = conn.execute("SELECT id FROM obras ORDER BY id ASC LIMIT 1").fetchone()
-        if remaining is None:
-            conn.execute("UPDATE configuracao_obra SET obra_ativa_id = NULL WHERE id = 1")
-        else:
-            conn.execute("UPDATE configuracao_obra SET obra_ativa_id = ? WHERE id = 1", (remaining[0],))
+    rows = get_data_client().table("obras").delete().eq("id", work_id).select("id").execute().data or []
+    if not rows:
+        raise PermissionError("A obra não existe ou a sessão não tem permissão para a eliminar.")
+    if st.session_state.get("active_work_id") == int(work_id):
+        st.session_state.pop("active_work_id", None)
 
 
-def load_config() -> dict | None:
+def load_config() -> dict:
     row = get_active_work()
     if row is None:
         return {
@@ -694,46 +575,45 @@ def add_financial_entry(
     data: str,
     observacoes: str = "",
 ) -> int:
-    with get_connection() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO movimentos_financeiros (tipo, descricao, categoria, valor, data, observacoes)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (tipo, descricao, categoria, float(valor), data, observacoes),
-        )
-        return int(cursor.lastrowid)
+    active_work = get_active_work()
+    if active_work is None:
+        raise ValueError("Crie ou selecione uma obra antes de registar movimentos financeiros.")
+    rows = get_data_client().table("movimentos_financeiros").insert(
+        {
+            "obra_id": active_work["id"],
+            "tipo": tipo,
+            "descricao": descricao,
+            "categoria": categoria,
+            "valor": float(valor),
+            "data": data,
+            "observacoes": observacoes,
+        }
+    ).execute().data or []
+    if not rows:
+        raise RuntimeError("O Supabase não confirmou o movimento financeiro.")
+    return int(rows[0]["id"])
 
 
 def list_financial_entries() -> list[dict]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, tipo, descricao, categoria, valor, data, observacoes
-            FROM movimentos_financeiros
-            ORDER BY data DESC, id DESC
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
+    active_work = get_active_work()
+    if active_work is None:
+        return []
+    result = get_data_client().table("movimentos_financeiros").select(
+        "id,tipo,descricao,categoria,valor,data,observacoes"
+    ).eq("obra_id", active_work["id"]).order("data", desc=True).order("id", desc=True).execute()
+    return result.data or []
 
 
 def get_financial_summary() -> dict:
-    with get_connection() as conn:
-        revenue = conn.execute(
-            "SELECT COALESCE(SUM(valor), 0) FROM movimentos_financeiros WHERE tipo = 'Receita'"
-        ).fetchone()[0]
-        expense = conn.execute(
-            "SELECT COALESCE(SUM(valor), 0) FROM movimentos_financeiros WHERE tipo = 'Despesa'"
-        ).fetchone()[0]
-        count = conn.execute(
-            "SELECT COUNT(*) FROM movimentos_financeiros"
-        ).fetchone()[0]
+    entries = list_financial_entries()
+    revenue = sum(float(entry["valor"]) for entry in entries if entry["tipo"] == "Receita")
+    expense = sum(float(entry["valor"]) for entry in entries if entry["tipo"] == "Despesa")
 
     return {
         "receitas": float(revenue),
         "despesas": float(expense),
         "saldo": float(revenue - expense),
-        "registos": int(count),
+        "registos": len(entries),
     }
 
 
@@ -746,49 +626,37 @@ def add_task(
     data_fim: str,
     status: str = "Pendente",
 ) -> int:
-    with get_connection() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO tarefas (titulo, descricao, responsavel, prioridade, data_inicio, data_fim, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (titulo, descricao, responsavel, prioridade, data_inicio, data_fim, status),
-        )
-        return int(cursor.lastrowid)
+    active_work = get_active_work()
+    if active_work is None:
+        raise ValueError("Crie ou selecione uma obra antes de adicionar tarefas.")
+    rows = get_data_client().table("tarefas").insert(
+        {
+            "obra_id": active_work["id"],
+            "titulo": titulo,
+            "descricao": descricao,
+            "responsavel": responsavel,
+            "prioridade": prioridade,
+            "data_inicio": data_inicio or None,
+            "data_fim": data_fim or None,
+            "status": status,
+        }
+    ).execute().data or []
+    if not rows:
+        raise RuntimeError("O Supabase não confirmou a criação da tarefa.")
+    return int(rows[0]["id"])
 
 
 def get_tasks() -> list[dict]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, titulo, descricao, responsavel, prioridade, data_inicio, data_fim, status
-            FROM tarefas
-            ORDER BY data_fim ASC, id ASC
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
+    active_work = get_active_work()
+    if active_work is None:
+        return []
+    result = get_data_client().table("tarefas").select(
+        "id,titulo,descricao,responsavel,prioridade,data_inicio,data_fim,status"
+    ).eq("obra_id", active_work["id"]).order("data_fim").order("id").execute()
+    return result.data or []
 
 
-def add_sample_movement() -> None:
-    with get_connection() as conn:
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM movimentos_financeiros"
-        ).fetchone()[0]
-        if existing > 0:
-            return
-
-        conn.execute(
-            """
-            INSERT INTO movimentos_financeiros (tipo, descricao, categoria, valor, data, observacoes)
-            VALUES
-                ('Receita', 'Pagamento inicial', 'Adiantamento', 15000.00, '2026-11-01', 'Recebido'),
-                ('Despesa', 'Compra de materiais', 'Materiais', 4200.00, '2026-11-02', 'Cimentos e areia'),
-                ('Despesa', 'Mão de obra', 'Recursos Humanos', 2800.00, '2026-11-03', 'Equipa de obra')
-            """
-        )
-
-
-def render_dashboard(config: sqlite3.Row, financial: dict, role: str = "manager") -> None:
+def render_dashboard(config: dict, financial: dict, role: str = "manager") -> None:
     language = st.session_state.get("language", "pt")
     render_page_heading(translate_text("dashboard_title", language))
     if role != "manager":
@@ -829,7 +697,7 @@ def render_dashboard(config: sqlite3.Row, financial: dict, role: str = "manager"
         )
 
 
-def render_configuracao(config: sqlite3.Row) -> None:
+def render_configuracao(config: dict) -> None:
     language = st.session_state.get("language", "pt")
     render_page_heading(translate_text("configuration", language))
 
@@ -890,6 +758,11 @@ def render_financeiro() -> None:
     col2.metric(translate_text("spend", language), f"€ {financial['despesas']:.2f}")
     col3.metric(translate_text("balance", language), f"€ {financial['saldo']:.2f}")
 
+    active_work = get_active_work()
+    if active_work is None:
+        st.info("Crie uma obra antes de registar movimentos financeiros.")
+        return
+
     tipo_map = {"Receita": translate_text("income", language), "Despesa": translate_text("expense", language)}
 
     with st.expander("Registar movimento", expanded=True):
@@ -935,6 +808,10 @@ def render_financeiro() -> None:
 def render_planeamento() -> None:
     language = st.session_state.get("language", "pt")
     render_page_heading(translate_text("planning", language))
+
+    if get_active_work() is None:
+        st.info("Crie uma obra antes de adicionar tarefas.")
+        return
 
     with st.expander("Adicionar tarefa", expanded=True):
         with st.form("task_form"):
@@ -1076,11 +953,12 @@ def main() -> None:
     if role is None:
         return
 
-    init_db()
-    add_sample_movement()
-
-    config = load_config()
-    financial = get_financial_summary() if role == "manager" else {}
+    try:
+        config = load_config()
+        financial = get_financial_summary() if role == "manager" else {}
+    except Exception:
+        st.error("Não foi possível carregar os dados do Supabase. Verifique as migrações e políticas RLS.")
+        st.stop()
 
     _, sidebar_logo, _ = st.sidebar.columns([1, 4, 1])
     with sidebar_logo:
@@ -1142,22 +1020,26 @@ def main() -> None:
         finally:
             st.session_state.pop("supabase_auth_client", None)
             st.session_state.pop("active_menu", None)
+            st.session_state.pop("active_work_id", None)
             st.rerun()
 
     menu = st.session_state["active_menu"]
 
-    if menu == "Obras":
-        render_obras(role)
-    elif menu == translate_text("dashboard", language):
-        render_dashboard(config, financial, role)
-    elif menu == translate_text("configuration", language):
-        render_configuracao(config)
-    elif menu == translate_text("finance", language):
-        render_financeiro()
-    elif menu == translate_text("planning", language):
-        render_planeamento()
-    elif menu == translate_text("reports", language):
-        render_relatorios()
+    try:
+        if menu == "Obras":
+            render_obras(role)
+        elif menu == translate_text("dashboard", language):
+            render_dashboard(config, financial, role)
+        elif menu == translate_text("configuration", language):
+            render_configuracao(config)
+        elif menu == translate_text("finance", language):
+            render_financeiro()
+        elif menu == translate_text("planning", language):
+            render_planeamento()
+        elif menu == translate_text("reports", language):
+            render_relatorios()
+    except Exception:
+        st.error("Não foi possível concluir a operação no Supabase. Verifique a obra ativa e as permissões da sua conta.")
 
 
 if __name__ == "__main__":

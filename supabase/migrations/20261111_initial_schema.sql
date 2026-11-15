@@ -71,11 +71,14 @@ grant select, insert, update, delete on table
     public.tarefas
 to authenticated;
 
-grant select on table
+revoke all on table
     public.obras,
     public.movimentos_financeiros,
     public.tarefas
-to anon;
+from anon;
+
+grant usage, select on all sequences in schema public to authenticated;
+revoke all on all sequences in schema public from anon, public;
 
 drop policy if exists obras_select_own on public.obras;
 drop policy if exists obras_insert_own on public.obras;
